@@ -1,7 +1,7 @@
 ---
 title: "Analytics Project"
 author: "Nick Dylla"
-output: html_document
+output: github_document
 ---
 #### This is an R Notebook to show how I handled the data and my workflow.
 ```{r}
