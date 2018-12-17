@@ -1,0 +1,132 @@
+---
+title: "Analytics Project"
+author: "Nick Dylla"
+output: html_document
+---
+#### This is an R Notebook to show how I handled the data and my workflow.
+```{r}
+# Load necessary packages
+library(pacman)    # This package is needed to simultaneously load/ install the following packages
+p_load(dplyr, magrittr,     # To clean data
+       rio,                 # To easily import csv's
+       data.table,          # To load and bind csv's
+       ggplot2,             # To visualize data
+       tidyr,               # To convert from wide to long formats, to "tidy" data
+       broom,               # To allow for linear regressions throughout the data
+       knitr,               # To save document as pdf
+       rmarkdown,           # To save document as pdf
+       pander,              # To save document as pdf (both needed)
+       DT,                  # Adds scrollbar to interactive dataframes
+       stringr,             # To grab characters from Name column to get Plot, Day, and Year info
+       install = TRUE)      # If another user doesn't have these packages, this will autom-install them
+```
+#### Read in the csv's with the raw gas data.
+```{r}
+# Get a List of all files in directory named with a key word, say all `.csv` files
+filenames <- list.files("/Users/nickdylla/Desktop/Richs Methane Data/Analytics Data", pattern="*.csv", full.names=TRUE)
+# Read all csv files in the folder and create a list of dataframes
+raw_gas_data <- lapply(filenames , read.csv)
+# Combine each dataframe in the list into a single dataframe
+raw_gas_data <- do.call("rbind", raw_gas_data)
+# Need to convert gas column to character
+raw_gas_data$gas <- as.character(raw_gas_data$gas)
+gas_data <- raw_gas_data %>% filter(gas == "CH4") # Filter gases that are only methane "ch4"
+# Need to rename the time columns to just be "0","15","30", and "45"instead of "X0", "X15" etc.
+names(gas_data)[names(gas_data) %in% c("X0","X15","X30","X45")] <- c("0","15","30","45")
+```
+
+#### Set flux chamber constants needed to calculate flux.
+```{r}
+# These constants will populate throughout the entire dataframe as they are the same for all CH4 samples
+chamberarea <- 0.0176625                # units = m2
+chambervolume <- 0.00176625             # units = m3
+chambervolumeL <- chambervolume*1000    # Chamber volume converted into L, units = L
+```
+#### Convert dataframe from wide to long format.
+```{r}
+# ch4_2014$Name needs to be a factor in order to convert to long format
+gas_data$Name <- as.factor(gas_data$Name)
+
+# This will now covert from wide to long format with gather()
+gas_data_long <- gather(gas_data, Time, Concentration, "0":"45", factor_key = TRUE) %>% 
+                        arrange(Name,Time) # Arrange will put group them by Name and then Time
+```
+#### Run linear regressions for each day.
+```{r warning=FALSE}
+# Need to convert Name back to character
+gas_data_long$Name <- as.character(gas_data_long$Name)
+
+# Need to convert Time to numeric
+# First need to convert Time to character in order for R to retain the actual values
+# otherwise solely trying to change to numeric will result in Time as 1,2,3,4
+gas_data_long$Time <- as.character(gas_data_long$Time)
+gas_data_long$Time <- as.numeric(gas_data_long$Time)
+
+# Run a linear model for each sample/day, group it by Name to do so
+lm_gas_data_long <- gas_data_long %>% group_by(Name) %>% do(tidy(lm(Concentration~Time, data=.)))
+
+# QC Data--Frank added either 2 or 0 for when the CH4 data was unreliable due to the GC, filter those samples out
+qc_lm_gas_data_long <- lm_gas_data_long %>% group_by(Name) %>% filter(estimate != 0 & estimate != 2)
+
+```
+#### Convert from long to wide in order for easier calculating.
+```{r}
+qc_lm_gas_data_wide <- qc_lm_gas_data_long %>% select(Name,term,estimate) # Select only the necessary columns
+qc_lm_gas_data_wide <- spread(qc_lm_gas_data_wide, term, estimate) # This is what will convert long to wide
+names(qc_lm_gas_data_wide)[names(qc_lm_gas_data_wide) %in% c("Time")] <- "Slope" # Time Column is Slope from model, just renaming it for clarity
+names(qc_lm_gas_data_wide)[names(qc_lm_gas_data_wide) %in% c("(Intercept)")] <- "Intercept"
+```
+#### Combine linear model data---qc_lm_gas_data_wide with methane data---gas_data_long.
+```{r}
+flux <- merge(qc_lm_gas_data_wide,gas_data_long, by = "Name") %>% arrange(Name,Time)
+```
+#### Calculate, based on each individual curve, the concentration that the linear model predicts for each day (t0,t15,t30,t45) in order to calculate standard error and root mean square error (RMSE) to assess the model fit.
+```{r}
+# Need to create a function to do the calculations
+model_assess <- flux %>% group_by(Name) %>% mutate(Predict = Slope*Time + Intercept,
+                                                  StdErr = (Predict-Concentration)**2,
+                                                  RMSE = mean(StdErr))
+# Predict is the predicted concentration based on the intecept and slope from the linear model
+# StdErr is the standard error between the concentration (i.e. predicted [t0] minus actual [t0])
+# RMSE is the root mean square error based on the StdErr
+```
+#### Flag any regressions with RMSE greater than MDCD.
+```{r}
+# In order to trust the linear model, the RMSE should be less than the MDCD (minimum detectable concentration difference)
+MDCD <- 0.02     # Based on data from Frank, units = ppm
+
+# Flag any samples with an RMSE > MDCD
+# 0 means linear regression is reliable, 1 means linear regression is not reliable
+qc_model_assess <- mutate(model_assess, Eval = ifelse(RMSE > 0.02, 1, 0))
+```
+#### Add important columns into the dataframe (i.e. Plot, Day, Year)
+```{r warning=FALSE}
+descriptive_data <- qc_model_assess
+descriptive_data$Plot <- str_sub(descriptive_data$Name, -3,-1) # Plot numbers, start 3 (-3) from right end on last character (-1)
+
+descriptive_data$Year <- str_sub(descriptive_data$Name, 1,2) # Year, start at 1 end at the second character
+# Need to add "20" to a new column to eventually merge the two values to make "2012, 2013 etc."
+descriptive_data$YearStart <- "20"
+# Now combine the character strings to make "2012 etc."
+descriptive_data$Year = paste(descriptive_data$YearStart,descriptive_data$Year, sep = "")
+# Great, now delete the unnecessary "YearStart" column
+descriptive_data <- descriptive_data[,!(names(descriptive_data) == "YearStart")]
+
+# Lastly, add the day into the dataframe
+descriptive_data$Day <- str_sub(descriptive_data$Name, 3,5) # Day, start at 3 end at 5
+
+# Convert these new columns (Plot, Year, and Day) from characters to numeric
+descriptive_data$Plot <- as.numeric(descriptive_data$Plot)
+descriptive_data$Year <- as.numeric(descriptive_data$Year)
+descriptive_data$Day <- as.numeric(descriptive_data$Day)
+
+# Round numbers so they're easier to interact with
+is.num <- sapply(descriptive_data, is.numeric)
+descriptive_data[is.num] <- lapply(descriptive_data[is.num], round, 6)
+datatable(descriptive_data, options = list(pageLength=25, scrollX=TRUE, autoWidth = TRUE),                              filter = 'top', class = 'cell-border stripe')
+```
+
+#### Export the dataframe as a csv for Rich to use in the future
+```{r}
+write.csv(descriptive_data, "R_Methane_Data.csv", row.names = FALSE)
+```
